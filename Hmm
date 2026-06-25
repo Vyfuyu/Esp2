@@ -28,7 +28,7 @@ for _, shelfModel in ipairs(CollectionService:GetTagged("Shelf")) do
     shelfModels[shelfModel.Name] = shelfModel
 end
 
--- 3. GIỮ NGUYÊN THUẬT TOÁN ĐỊNH DANH KỆ GỐC (CHUẨN XÁC 100%)
+-- 3. THUẬT TOÁN ĐỊNH DANH KỆ GỐC (CHUẨN XÁC 100%)
 local function getShelfAssignedSeries(shelfId)
     local shelfData = LibraryReplica.Data.Shelves[shelfId]
     if not shelfData then return nil end
@@ -60,31 +60,38 @@ local function findShelfForSeries(seriesName, genreName, volumeCount)
     end
 end
 
--- 4. TELEPORT THÔ (RAW TP) - TỐC ĐỘ ÁNH SÁNG
+-- 4. TELEPORT THÔ (RAW TP) - FIX LỖI VA CHẠM VẬT LÝ
 local function rawTeleport(obj)
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
     if not root then return end
+    
     local part = obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")) or obj
     if part then
-        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 1.5, 0))
+        -- FIX: Thay vì đặt sát sàn hoặc trùng tâm, ta đưa nhân vật lên cao hơn hẳn 3.5 studs để tránh va chạm (Anti-clipping)
+        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3.5, 0))
+        
+        -- Vô hiệu hóa lực quán tính tạm thời giúp nhân vật đứng im tại điểm đến, không bị trượt/văng đi
+        root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+        root.AssemblyAngularVelocity = Vector3.new(0,0,0)
     end
 end
 
--- 5. ENGINE VÒNG LẶP CUỐN CHIẾU 5 CUỐN (MAX SPEED & ACCURACY)
+-- 5. ENGINE VÒNG LẶP CUỐN CHIẾU 5 CUỐN (ỔN ĐỊNH CAO)
 task.spawn(function()
-    print("[🔥] ENGINE SIÊU HIỆU NĂNG ĐÃ KÍCH HOẠT!")
+    print("[🔥] KÍCH HOẠT ENGINE FIX GIẬT LẮC VẬT LÝ!")
 
     while getgenv().Running do
         local books = BooksFolder:GetChildren()
-        if #books == 0 then task.wait(0.2) continue end
+        if #books == 0 then task.wait(0.3) continue end
 
         local inventoryCount = 0
-        local actionQueue = {} -- Lưu danh sách kệ cần trả sách sau khi nhặt xong
+        local actionQueue = {} 
 
-        -- BƯỚC 1: QUÉT NHANH VÀ GOM TỐI ĐA 5 CUỐN VÀO INVENTORY
+        -- BƯỚC 1: GOM TỐI ĐA 5 CUỐN VÀO INVENTORY
         for _, book in ipairs(books) do
-            if inventoryCount >= 5 then break end -- Giới hạn 5 cuốn từ game
+            if inventoryCount >= 5 then break end 
             if not book or not book.Parent then continue end
 
             local seriesName, volumeStr = book.Name:match("^(.-)_(.+)$")
@@ -97,37 +104,38 @@ task.spawn(function()
                     if shelfModel then
                         local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
                         
-                        -- Nếu kệ chưa có cuốn này, nạp vào hàng đợi gom hàng
                         if not (shelfData and shelfData.Books[tostring(volumeNum)]) then
                             inventoryCount = inventoryCount + 1
                             
-                            -- Bay tới hút sách lập tức
+                            -- Bay tới nhặt sách
                             rawTeleport(book)
+                            task.wait(0.03) -- Ổn định vị trí trước khi bắn Remote
                             LibraryReplica:FireServer("Grab", book)
                             
-                            -- Lưu lại thông tin để tí nữa bay đi trả hàng một loạt
                             table.insert(actionQueue, {
                                 shelf = shelfModel,
                                 slot = volumeNum - 1
                             })
                             
-                            task.wait() -- Chỉ nghỉ đúng 1 frame cực nhỏ để server nhận diện vật lý nhặt sách
+                            task.wait(0.02) -- Cho Server 1 khoảng ngắn để xác nhận đã nhặt sách thành công
                         end
                     end
                 end
             end
         end
 
-        -- BƯỚC 2: BAY ĐI TRẢ HÀNG LẬP TỨC (NẾU CÓ SÁCH TRONG TAY)
+        -- BƯỚC 2: BAY ĐI CẤT SÁCH
         if #actionQueue > 0 then
             for _, action in ipairs(actionQueue) do
+                if not getgenv().Running then break end
+                
                 rawTeleport(action.shelf)
+                task.wait(0.03) -- Ổn định vị trí trước khi đặt vào kệ
                 LibraryReplica:FireServer("Place", action.shelf, action.slot)
-                task.wait() -- Đợi 1 frame rất nhỏ để tránh trùng lặp vị trí slot
+                task.wait(0.02) 
             end
         end
 
-        -- Nghỉ một nhịp siêu ngắn trước khi lặp đợt 5 cuốn tiếp theo
-        task.wait(0.01)
+        task.wait(0.05) -- Độ nghỉ giữa các đợt gom hàng để tránh lag Camera
     end
 end)
