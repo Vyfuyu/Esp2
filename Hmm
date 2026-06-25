@@ -9,26 +9,45 @@ local Loader = require(ReplicatedStorage.Packages.Loader)
 local ReplicaController = require(Loader.Shared.Utility.ReplicaController)
 local BooksData = require(Loader.Shared.Data.Books)
 
--- 1. CHỜ REPLICA CONTROLLER CORES
+-- ==========================================
+-- CẤU HÌNH ÉP XUNG (MAX SPEED FARMING)
+-- ==========================================
+local CONFIG = {
+    GRAB_DELAY = 0.01,     -- Giảm tối đa để nhặt ngay lập tức khi chạm vào sách
+    PLACE_DELAY = 0.12,    -- Tốc độ vàng để server nhận lệnh đặt sách (Có thể tăng lên 0.15 nếu mạng lag)
+    TELEPORT_DELAY = 0.01, -- Dịch chuyển chớp nhoáng
+    OFFSET_Y = 3.0,        -- Độ cao offset tiêu chuẩn
+}
+
 local LibraryReplica = nil
 for _, r in pairs(ReplicaController._replicas) do
     if r.Class == "Library" then LibraryReplica = r break end
 end
 if not LibraryReplica then
-    ReplicaController.ReplicaOfClassCreated("Library", function(replica) LibraryReplica = replica end)
+    local replicaConnection
+    replicaConnection = ReplicaController.ReplicaOfClassCreated("Library", function(replica)
+        LibraryReplica = replica
+        if replicaConnection then replicaConnection:Disconnect() end
+    end)
     while not LibraryReplica do task.wait() end
 end
 
-local BooksFolder = Workspace.Library.Books
+local Library = Workspace:WaitForChild("Library")
+local BooksFolder = Library:WaitForChild("Books")
 local player = Players.LocalPlayer
 
--- 2. FAST CACHE MÔ HÌNH KỆ SÁCH
+-- Khóa Camera góc nhìn từ trên xuống để giảm render lag khi bay liên tục
+player.CameraMode = Enum.CameraMode.Classic
+player.CameraMinZoomDistance = 15
+task.delay(0.1, function() player.CameraMinZoomDistance = 0.5 end)
+
 local shelfModels = {}
 for _, shelfModel in ipairs(CollectionService:GetTagged("Shelf")) do
     shelfModels[shelfModel.Name] = shelfModel
 end
 
--- 3. THUẬT TOÁN ĐỊNH DANH KỆ GỐC (CHUẨN XÁC 100%)
+local shelfCache = {}
+
 local function getShelfAssignedSeries(shelfId)
     local shelfData = LibraryReplica.Data.Shelves[shelfId]
     if not shelfData then return nil end
@@ -37,105 +56,130 @@ local function getShelfAssignedSeries(shelfId)
         local seriesName = bookName:match("^(.-)_(.+)$")
         if seriesName then return seriesName end
     end
+    return nil
 end
 
 local function findShelfForSeries(seriesName, genreName, volumeCount)
-    -- Ưu tiên 1: Kệ đang chứa bộ này
+    if shelfCache[seriesName] then
+        local shelfModel = shelfModels[shelfCache[seriesName]]
+        if shelfModel then
+            local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
+            if shelfData and not shelfData.Completed then return shelfModel end
+        end
+    end
+
     for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
         if not shelfData.Completed and shelfData.Category == genreName then
             local shelfModel = shelfModels[shelfId]
             if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
-                if getShelfAssignedSeries(shelfId) == seriesName then return shelfModel end
+                if getShelfAssignedSeries(shelfId) == seriesName then
+                    shelfCache[seriesName] = shelfId
+                    return shelfModel
+                end
             end
         end
     end
-    -- Ưu tiên 2: Kệ trống
+
     for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
         if not shelfData.Completed and shelfData.Category == genreName then
             local shelfModel = shelfModels[shelfId]
             if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
-                if not getShelfAssignedSeries(shelfId) and next(shelfData.Books) == nil then return shelfModel end
+                if not getShelfAssignedSeries(shelfId) and next(shelfData.Books) == nil then
+                    shelfCache[seriesName] = shelfId
+                    return shelfModel
+                end
             end
         end
     end
+    return nil
 end
 
--- 4. TELEPORT THÔ (RAW TP) - FIX LỖI VA CHẠM VẬT LÝ
-local function rawTeleport(obj)
+-- Hàm dịch chuyển siêu tốc, triệt tiêu hoàn toàn vận tốc rơi tự do
+local function fastTeleport(targetObj)
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    if not root then return end
+    if not root or (char:FindFirstChildOfClass("Humanoid") and char:FindFirstChildOfClass("Humanoid").Health <= 0) then return false end
     
-    local part = obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")) or obj
-    if part then
-        -- FIX: Thay vì đặt sát sàn hoặc trùng tâm, ta đưa nhân vật lên cao hơn hẳn 3.5 studs để tránh va chạm (Anti-clipping)
-        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3.5, 0))
-        
-        -- Vô hiệu hóa lực quán tính tạm thời giúp nhân vật đứng im tại điểm đến, không bị trượt/văng đi
-        root.AssemblyLinearVelocity = Vector3.new(0,0,0)
-        root.AssemblyAngularVelocity = Vector3.new(0,0,0)
+    local targetPart = targetObj:IsA("Model") and (targetObj.PrimaryPart or targetObj:FindFirstChildOfClass("BasePart")) or targetObj
+    if targetPart then
+        root.Velocity = Vector3.new(0, 0, 0)
+        root.RotVelocity = Vector3.new(0, 0, 0) -- Triệt tiêu cả lực xoay thân
+        root.CFrame = CFrame.new(targetPart.Position + Vector3.new(0, CONFIG.OFFSET_Y, 0)) * root.CFrame.Rotation
+        task.wait(CONFIG.TELEPORT_DELAY)
+        return true
     end
+    return false
 end
 
--- 5. ENGINE VÒNG LẶP CUỐN CHIẾU 5 CUỐN (ỔN ĐỊNH CAO)
+-- ==========================================
+-- VÒNG LẶP FARM SIÊU TỐC (FAST-LOOP PIPELINE)
+-- ==========================================
 task.spawn(function()
-    print("[🔥] KÍCH HOẠT ENGINE FIX GIẬT LẮC VẬT LÝ!")
-
     while getgenv().Running do
-        local books = BooksFolder:GetChildren()
-        if #books == 0 then task.wait(0.3) continue end
+        local rawBooks = BooksFolder:GetChildren()
+        if #rawBooks == 0 then 
+            task.wait(0.2) -- Giảm thời gian chờ quét sách mới xuống 0.2s thay vì 1s
+            continue
+        end
 
-        local inventoryCount = 0
-        local actionQueue = {} 
+        -- Phân nhóm sách theo Series để gom cụm hành trình nhanh nhất
+        local sortedBooks = {}
+        for _, book in ipairs(rawBooks) do
+            if book:IsA("BasePart") and book.Parent then
+                local seriesName, volumeStr = book.Name:match("^(.-)_(.+)$")
+                local volumeNum = tonumber(volumeStr)
+                if seriesName and volumeNum then
+                    if not sortedBooks[seriesName] then sortedBooks[seriesName] = {} end
+                    table.insert(sortedBooks[seriesName], {instance = book, volume = volumeNum})
+                end
+            end
+        end
 
-        -- BƯỚC 1: GOM TỐI ĐA 5 CUỐN VÀO INVENTORY
-        for _, book in ipairs(books) do
-            if inventoryCount >= 5 then break end 
-            if not book or not book.Parent then continue end
+        local processedAny = false
 
-            local seriesName, volumeStr = book.Name:match("^(.-)_(.+)$")
-            local volumeNum = tonumber(volumeStr)
+        for seriesName, bookList in pairs(sortedBooks) do
+            if not getgenv().Running then break end
+            
+            local genreName, bookInfo = BooksData.GetCategory(seriesName)
+            if not (genreName and bookInfo) then continue end
 
-            if seriesName and volumeNum then
-                local genreName, bookInfo = BooksData.GetCategory(seriesName)
-                if genreName and bookInfo then
-                    local shelfModel = findShelfForSeries(seriesName, genreName, bookInfo.VolumeCount)
-                    if shelfModel then
-                        local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
+            -- Sắp xếp sách trong cùng một Series theo thứ tự tập từ nhỏ đến lớn để đặt mượt hơn
+            table.sort(bookList, function(a, b) return a.volume < b.volume end)
+
+            for _, bookData in ipairs(bookList) do
+                if not getgenv().Running then break end
+                
+                local book = bookData.instance
+                local volumeNum = bookData.volume
+                
+                if not book.Parent then continue end
+
+                local shelfModel = findShelfForSeries(seriesName, genreName, bookInfo.VolumeCount)
+                if shelfModel then
+                    local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
+                    local slotIndex = tostring(volumeNum - 1)
+                    
+                    if shelfData and not shelfData.Books[slotIndex] then
+                        processedAny = true
                         
-                        if not (shelfData and shelfData.Books[tostring(volumeNum)]) then
-                            inventoryCount = inventoryCount + 1
-                            
-                            -- Bay tới nhặt sách
-                            rawTeleport(book)
-                            task.wait(0.03) -- Ổn định vị trí trước khi bắn Remote
+                        -- KIỂU PIPELINE: Dịch chuyển và FireServer đồng thời để tối ưu hóa Ping mạng
+                        if fastTeleport(book) then
                             LibraryReplica:FireServer("Grab", book)
+                            task.wait(CONFIG.GRAB_DELAY)
                             
-                            table.insert(actionQueue, {
-                                shelf = shelfModel,
-                                slot = volumeNum - 1
-                            })
-                            
-                            task.wait(0.02) -- Cho Server 1 khoảng ngắn để xác nhận đã nhặt sách thành công
+                            if fastTeleport(shelfModel) then
+                                LibraryReplica:FireServer("Place", shelfModel, volumeNum - 1)
+                                task.wait(CONFIG.PLACE_DELAY) -- Thời gian hồi để tránh bị Server từ chối lệnh
+                            end
                         end
                     end
                 end
             end
         end
 
-        -- BƯỚC 2: BAY ĐI CẤT SÁCH
-        if #actionQueue > 0 then
-            for _, action in ipairs(actionQueue) do
-                if not getgenv().Running then break end
-                
-                rawTeleport(action.shelf)
-                task.wait(0.03) -- Ổn định vị trí trước khi đặt vào kệ
-                LibraryReplica:FireServer("Place", action.shelf, action.slot)
-                task.wait(0.02) 
-            end
+        if not processedAny then
+            task.wait(0.1) -- Giảm thời gian nghỉ khi trống sách xuống tối thiểu
         end
-
-        task.wait(0.05) -- Độ nghỉ giữa các đợt gom hàng để tránh lag Camera
     end
+    print("[Auto Library] Đã dừng Fast Farm.")
 end)
