@@ -9,14 +9,11 @@ local Loader = require(ReplicatedStorage.Packages.Loader)
 local ReplicaController = require(Loader.Shared.Utility.ReplicaController)
 local BooksData = require(Loader.Shared.Data.Books)
 
--- ==========================================
--- CẤU HÌNH ÉP XUNG (MAX SPEED FARMING)
--- ==========================================
+-- Cấu hình an toàn ổn định mạng
 local CONFIG = {
-    GRAB_DELAY = 0.01,     -- Giảm tối đa để nhặt ngay lập tức khi chạm vào sách
-    PLACE_DELAY = 0.12,    -- Tốc độ vàng để server nhận lệnh đặt sách (Có thể tăng lên 0.15 nếu mạng lag)
-    TELEPORT_DELAY = 0.01, -- Dịch chuyển chớp nhoáng
-    OFFSET_Y = 3.0,        -- Độ cao offset tiêu chuẩn
+    BASE_DELAY = 0.05,     -- Thời gian nghỉ tối thiểu để tránh spam network
+    TIMEOUT = 1.5,         -- Thời gian hủy hàng đợi nếu server bị lag quá lâu
+    OFFSET_Y = 3.2,        
 }
 
 local LibraryReplica = nil
@@ -36,9 +33,9 @@ local Library = Workspace:WaitForChild("Library")
 local BooksFolder = Library:WaitForChild("Books")
 local player = Players.LocalPlayer
 
--- Khóa Camera góc nhìn từ trên xuống để giảm render lag khi bay liên tục
+-- Fix Camera để mượt mà hơn
 player.CameraMode = Enum.CameraMode.Classic
-player.CameraMinZoomDistance = 15
+player.CameraMinZoomDistance = 10
 task.delay(0.1, function() player.CameraMinZoomDistance = 0.5 end)
 
 local shelfModels = {}
@@ -94,8 +91,7 @@ local function findShelfForSeries(seriesName, genreName, volumeCount)
     return nil
 end
 
--- Hàm dịch chuyển siêu tốc, triệt tiêu hoàn toàn vận tốc rơi tự do
-local function fastTeleport(targetObj)
+local function safeTeleport(targetObj)
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root or (char:FindFirstChildOfClass("Humanoid") and char:FindFirstChildOfClass("Humanoid").Health <= 0) then return false end
@@ -103,26 +99,37 @@ local function fastTeleport(targetObj)
     local targetPart = targetObj:IsA("Model") and (targetObj.PrimaryPart or targetObj:FindFirstChildOfClass("BasePart")) or targetObj
     if targetPart then
         root.Velocity = Vector3.new(0, 0, 0)
-        root.RotVelocity = Vector3.new(0, 0, 0) -- Triệt tiêu cả lực xoay thân
+        root.RotVelocity = Vector3.new(0, 0, 0)
         root.CFrame = CFrame.new(targetPart.Position + Vector3.new(0, CONFIG.OFFSET_Y, 0)) * root.CFrame.Rotation
-        task.wait(CONFIG.TELEPORT_DELAY)
         return true
     end
     return false
 end
 
+-- Hàm thông minh: Chờ đồng bộ dữ liệu từ Replica Server trước khi làm việc tiếp theo
+local function awaitReplicaUpdate(shelfName, slotIndex)
+    local startTime = os.clock()
+    while os.clock() - startTime < CONFIG.TIMEOUT do
+        local shelfData = LibraryReplica.Data.Shelves[shelfName]
+        if shelfData and shelfData.Books[slotIndex] then
+            return true -- Server đã xác nhận đặt sách thành công
+        end
+        task.wait() -- Đợi frame tiếp theo để kiểm tra lại
+    end
+    return false -- Quá thời gian chờ (Server bị drop lệnh)
+end
+
 -- ==========================================
--- VÒNG LẶP FARM SIÊU TỐC (FAST-LOOP PIPELINE)
+-- LUỒNG CHẠY THÔNG MINH (ANTI-DESYNC)
 -- ==========================================
 task.spawn(function()
     while getgenv().Running do
         local rawBooks = BooksFolder:GetChildren()
         if #rawBooks == 0 then 
-            task.wait(0.2) -- Giảm thời gian chờ quét sách mới xuống 0.2s thay vì 1s
+            task.wait(0.5)
             continue
         end
 
-        -- Phân nhóm sách theo Series để gom cụm hành trình nhanh nhất
         local sortedBooks = {}
         for _, book in ipairs(rawBooks) do
             if book:IsA("BasePart") and book.Parent then
@@ -135,15 +142,12 @@ task.spawn(function()
             end
         end
 
-        local processedAny = false
-
         for seriesName, bookList in pairs(sortedBooks) do
             if not getgenv().Running then break end
             
             local genreName, bookInfo = BooksData.GetCategory(seriesName)
             if not (genreName and bookInfo) then continue end
 
-            -- Sắp xếp sách trong cùng một Series theo thứ tự tập từ nhỏ đến lớn để đặt mượt hơn
             table.sort(bookList, function(a, b) return a.volume < b.volume end)
 
             for _, bookData in ipairs(bookList) do
@@ -152,34 +156,46 @@ task.spawn(function()
                 local book = bookData.instance
                 local volumeNum = bookData.volume
                 
+                -- Kiểm tra real-time nếu sách đã bị biến mất
                 if not book.Parent then continue end
 
                 local shelfModel = findShelfForSeries(seriesName, genreName, bookInfo.VolumeCount)
                 if shelfModel then
-                    local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
+                    local shelfName = shelfModel.Name
                     local slotIndex = tostring(volumeNum - 1)
+                    local shelfData = LibraryReplica.Data.Shelves[shelfName]
                     
                     if shelfData and not shelfData.Books[slotIndex] then
-                        processedAny = true
                         
-                        -- KIỂU PIPELINE: Dịch chuyển và FireServer đồng thời để tối ưu hóa Ping mạng
-                        if fastTeleport(book) then
+                        -- Bước 1: Bay tới nhặt sách
+                        if safeTeleport(book) then
                             LibraryReplica:FireServer("Grab", book)
-                            task.wait(CONFIG.GRAB_DELAY)
                             
-                            if fastTeleport(shelfModel) then
+                            -- Đợi một nhịp cực ngắn để đảm bảo Character đã chạm trúng hitbox của sách trên server
+                            task.wait(CONFIG.BASE_DELAY) 
+                            
+                            -- Bước 2: Bay tới kệ và đặt sách
+                            if safeTeleport(shelfModel) then
                                 LibraryReplica:FireServer("Place", shelfModel, volumeNum - 1)
-                                task.wait(CONFIG.PLACE_DELAY) -- Thời gian hồi để tránh bị Server từ chối lệnh
+                                
+                                -- Thay vì đặt bừa bãi thời gian tĩnh (0.12s), script sẽ đứng đợi 
+                                -- cho tới khi Replica báo về là sách đã nằm trên kệ thành công.
+                                local success = awaitReplicaUpdate(shelfName, slotIndex)
+                                
+                                if success then
+                                    -- Nếu mạng ngon, nó sẽ làm cuốn tiếp theo NGAY LẬP TỨC không cần chờ.
+                                    task.wait(0.02) 
+                                else
+                                    -- Nếu mạng lag dẫn đến mất lệnh, nghỉ một chút để ổn định lại luồng mạng
+                                    task.wait(0.2)
+                                end
                             end
                         end
                     end
                 end
             end
         end
-
-        if not processedAny then
-            task.wait(0.1) -- Giảm thời gian nghỉ khi trống sách xuống tối thiểu
-        end
+        task.wait(0.1)
     end
-    print("[Auto Library] Đã dừng Fast Farm.")
+    print("[Auto Library] Đã dừng Farm.")
 end)
