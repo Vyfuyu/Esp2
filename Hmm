@@ -9,33 +9,26 @@ local Loader = require(ReplicatedStorage.Packages.Loader)
 local ReplicaController = require(Loader.Shared.Utility.ReplicaController)
 local BooksData = require(Loader.Shared.Data.Books)
 
--- 1. CHỜ REPLICA
+-- 1. CHỜ REPLICA CONTROLLER CORES
 local LibraryReplica = nil
 for _, r in pairs(ReplicaController._replicas) do
-    if r.Class == "Library" then
-        LibraryReplica = r
-        break
-    end
+    if r.Class == "Library" then LibraryReplica = r break end
 end
-
 if not LibraryReplica then
-    ReplicaController.ReplicaOfClassCreated("Library", function(replica)
-        LibraryReplica = replica
-    end)
+    ReplicaController.ReplicaOfClassCreated("Library", function(replica) LibraryReplica = replica end)
     while not LibraryReplica do task.wait() end
 end
 
-local Library = Workspace.Library
-local BooksFolder = Library.Books
+local BooksFolder = Workspace.Library.Books
 local player = Players.LocalPlayer
 
--- 2. CACHE MÔ HÌNH KỆ SÁCH
+-- 2. FAST CACHE MÔ HÌNH KỆ SÁCH
 local shelfModels = {}
 for _, shelfModel in ipairs(CollectionService:GetTagged("Shelf")) do
     shelfModels[shelfModel.Name] = shelfModel
 end
 
--- 3. THUẬT TOÁN ĐỊNH DANH KỆ (GIỮ NGUYÊN TỪ BẢN GỐC ĐỂ CHUẨN XÁC 100%)
+-- 3. GIỮ NGUYÊN THUẬT TOÁN ĐỊNH DANH KỆ GỐC (CHUẨN XÁC 100%)
 local function getShelfAssignedSeries(shelfId)
     local shelfData = LibraryReplica.Data.Shelves[shelfId]
     if not shelfData then return nil end
@@ -47,66 +40,52 @@ local function getShelfAssignedSeries(shelfId)
 end
 
 local function findShelfForSeries(seriesName, genreName, volumeCount)
-    -- Ưu tiên 1: Kệ đã chứa truyện của bộ này
+    -- Ưu tiên 1: Kệ đang chứa bộ này
     for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
         if not shelfData.Completed and shelfData.Category == genreName then
             local shelfModel = shelfModels[shelfId]
             if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
-                if getShelfAssignedSeries(shelfId) == seriesName then 
-                    return shelfModel 
-                end
+                if getShelfAssignedSeries(shelfId) == seriesName then return shelfModel end
             end
         end
     end
-    -- Ưu tiên 2: Kệ trống hoàn toàn chưa ai dùng
+    -- Ưu tiên 2: Kệ trống
     for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
         if not shelfData.Completed and shelfData.Category == genreName then
             local shelfModel = shelfModels[shelfId]
             if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
-                if not getShelfAssignedSeries(shelfId) and next(shelfData.Books) == nil then 
-                    return shelfModel 
-                end
+                if not getShelfAssignedSeries(shelfId) and next(shelfData.Books) == nil then return shelfModel end
             end
         end
     end
 end
 
--- 4. GHOST TELEPORT (NO TELEPORT VISIBLE) - GIẬT VỀ TRONG 1 FRAME MẠNG
-local function executeGhostAction(obj, actionCallback)
+-- 4. TELEPORT THÔ (RAW TP) - TỐC ĐỘ ÁNH SÁNG
+local function rawTeleport(obj)
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
-
+    if not root then return end
     local part = obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")) or obj
-    if not part then return false end
-
-    local originalCFrame = root.CFrame
-
-    -- Dịch chuyển tức thời tới mục tiêu
-    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 1.5, 0))
-    
-    -- Chờ 1 tick cực nhỏ để Server đồng bộ packet vị trí hợp lệ
-    task.wait(0.02)
-
-    if actionCallback then actionCallback() end
-
-    -- Trả ngay lập tức về vị trí ban đầu (Bypass góc nhìn người khác)
-    root.CFrame = originalCFrame
-    return true
+    if part then
+        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 1.5, 0))
+    end
 end
 
--- 5. ENGINE FAST QUEUE XỬ LÝ SONG SONG GIẢ LẬP
+-- 5. ENGINE VÒNG LẶP CUỐN CHIẾU 5 CUỐN (MAX SPEED & ACCURACY)
 task.spawn(function()
-    print("[⚡] Khởi động Auto Farm Thần Tốc & Không Lộ Vị Trí...")
+    print("[🔥] ENGINE SIÊU HIỆU NĂNG ĐÃ KÍCH HOẠT!")
 
-    local allBooks = BooksFolder:GetChildren()
-    
-    for _, book in ipairs(allBooks) do
-        if not getgenv().Running then break end
+    while getgenv().Running do
+        local books = BooksFolder:GetChildren()
+        if #books == 0 then task.wait(0.2) continue end
 
-        -- Tạo luồng xử lý song song giả lập (Instant Queue) cho từng cuốn
-        task.spawn(function()
-            if not (book and book.Parent == BooksFolder) then return end
+        local inventoryCount = 0
+        local actionQueue = {} -- Lưu danh sách kệ cần trả sách sau khi nhặt xong
+
+        -- BƯỚC 1: QUÉT NHANH VÀ GOM TỐI ĐA 5 CUỐN VÀO INVENTORY
+        for _, book in ipairs(books) do
+            if inventoryCount >= 5 then break end -- Giới hạn 5 cuốn từ game
+            if not book or not book.Parent then continue end
 
             local seriesName, volumeStr = book.Name:match("^(.-)_(.+)$")
             local volumeNum = tonumber(volumeStr)
@@ -114,39 +93,41 @@ task.spawn(function()
             if seriesName and volumeNum then
                 local genreName, bookInfo = BooksData.GetCategory(seriesName)
                 if genreName and bookInfo then
-                    
                     local shelfModel = findShelfForSeries(seriesName, genreName, bookInfo.VolumeCount)
                     if shelfModel then
                         local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
                         
-                        -- Kiểm tra xem kệ tại vị trí tập này đã có sách chưa
+                        -- Nếu kệ chưa có cuốn này, nạp vào hàng đợi gom hàng
                         if not (shelfData and shelfData.Books[tostring(volumeNum)]) then
+                            inventoryCount = inventoryCount + 1
                             
-                            -- Hành động 1: Nhặt sách ẩn danh
-                            executeGhostAction(book, function()
-                                LibraryReplica:FireServer("Grab", book)
-                            end)
-
-                            -- Giãn cách siêu nhỏ (Bù delay nhận diện của Server)
-                            task.wait(0.04)
-
-                            -- Hành động 2: Đặt sách ẩn danh vào kệ
-                            if getgenv().Running and book.Parent == nil then -- Chỉ đặt khi Client đã Grab thành công
-                                executeGhostAction(shelfModel, function()
-                                    LibraryReplica:FireServer("Place", shelfModel, volumeNum - 1)
-                                end)
-                            end
-
+                            -- Bay tới hút sách lập tức
+                            rawTeleport(book)
+                            LibraryReplica:FireServer("Grab", book)
+                            
+                            -- Lưu lại thông tin để tí nữa bay đi trả hàng một loạt
+                            table.insert(actionQueue, {
+                                shelf = shelfModel,
+                                slot = volumeNum - 1
+                            })
+                            
+                            task.wait() -- Chỉ nghỉ đúng 1 frame cực nhỏ để server nhận diện vật lý nhặt sách
                         end
                     end
                 end
             end
-        end)
-        
-        -- Thêm một khoảng chờ siêu ngắn 0.01s giữa các Thread để tránh làm tụt FPS hoặc nghẽn băng thông Remote
-        task.wait(0.01) 
-    end
+        end
 
-    print("[🎯] Đã đưa toàn bộ sách vào hàng đợi thành công!")
-    getgenv().Running = false
+        -- BƯỚC 2: BAY ĐI TRẢ HÀNG LẬP TỨC (NẾU CÓ SÁCH TRONG TAY)
+        if #actionQueue > 0 then
+            for _, action in ipairs(actionQueue) do
+                rawTeleport(action.shelf)
+                LibraryReplica:FireServer("Place", action.shelf, action.slot)
+                task.wait() -- Đợi 1 frame rất nhỏ để tránh trùng lặp vị trí slot
+            end
+        end
+
+        -- Nghỉ một nhịp siêu ngắn trước khi lặp đợt 5 cuốn tiếp theo
+        task.wait(0.01)
+    end
 end)
