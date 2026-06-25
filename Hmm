@@ -1,0 +1,152 @@
+getgenv().Running = true
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+
+local Loader = require(ReplicatedStorage.Packages.Loader)
+local ReplicaController = require(Loader.Shared.Utility.ReplicaController)
+local BooksData = require(Loader.Shared.Data.Books)
+
+-- 1. CHỜ REPLICA
+local LibraryReplica = nil
+for _, r in pairs(ReplicaController._replicas) do
+    if r.Class == "Library" then
+        LibraryReplica = r
+        break
+    end
+end
+
+if not LibraryReplica then
+    ReplicaController.ReplicaOfClassCreated("Library", function(replica)
+        LibraryReplica = replica
+    end)
+    while not LibraryReplica do task.wait() end
+end
+
+local Library = Workspace.Library
+local BooksFolder = Library.Books
+local player = Players.LocalPlayer
+
+-- 2. CACHE MÔ HÌNH KỆ SÁCH
+local shelfModels = {}
+for _, shelfModel in ipairs(CollectionService:GetTagged("Shelf")) do
+    shelfModels[shelfModel.Name] = shelfModel
+end
+
+-- 3. THUẬT TOÁN ĐỊNH DANH KỆ (GIỮ NGUYÊN TỪ BẢN GỐC ĐỂ CHUẨN XÁC 100%)
+local function getShelfAssignedSeries(shelfId)
+    local shelfData = LibraryReplica.Data.Shelves[shelfId]
+    if not shelfData then return nil end
+    for _, placedBook in pairs(shelfData.Books) do
+        local bookName = typeof(placedBook) == "Instance" and placedBook.Name or placedBook
+        local seriesName = bookName:match("^(.-)_(.+)$")
+        if seriesName then return seriesName end
+    end
+end
+
+local function findShelfForSeries(seriesName, genreName, volumeCount)
+    -- Ưu tiên 1: Kệ đã chứa truyện của bộ này
+    for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
+        if not shelfData.Completed and shelfData.Category == genreName then
+            local shelfModel = shelfModels[shelfId]
+            if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
+                if getShelfAssignedSeries(shelfId) == seriesName then 
+                    return shelfModel 
+                end
+            end
+        end
+    end
+    -- Ưu tiên 2: Kệ trống hoàn toàn chưa ai dùng
+    for shelfId, shelfData in pairs(LibraryReplica.Data.Shelves) do
+        if not shelfData.Completed and shelfData.Category == genreName then
+            local shelfModel = shelfModels[shelfId]
+            if shelfModel and shelfModel:GetAttribute("Width") == volumeCount then
+                if not getShelfAssignedSeries(shelfId) and next(shelfData.Books) == nil then 
+                    return shelfModel 
+                end
+            end
+        end
+    end
+end
+
+-- 4. GHOST TELEPORT (NO TELEPORT VISIBLE) - GIẬT VỀ TRONG 1 FRAME MẠNG
+local function executeGhostAction(obj, actionCallback)
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    local part = obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")) or obj
+    if not part then return false end
+
+    local originalCFrame = root.CFrame
+
+    -- Dịch chuyển tức thời tới mục tiêu
+    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 1.5, 0))
+    
+    -- Chờ 1 tick cực nhỏ để Server đồng bộ packet vị trí hợp lệ
+    task.wait(0.02)
+
+    if actionCallback then actionCallback() end
+
+    -- Trả ngay lập tức về vị trí ban đầu (Bypass góc nhìn người khác)
+    root.CFrame = originalCFrame
+    return true
+end
+
+-- 5. ENGINE FAST QUEUE XỬ LÝ SONG SONG GIẢ LẬP
+task.spawn(function()
+    print("[⚡] Khởi động Auto Farm Thần Tốc & Không Lộ Vị Trí...")
+
+    local allBooks = BooksFolder:GetChildren()
+    
+    for _, book in ipairs(allBooks) do
+        if not getgenv().Running then break end
+
+        -- Tạo luồng xử lý song song giả lập (Instant Queue) cho từng cuốn
+        task.spawn(function()
+            if not (book and book.Parent == BooksFolder) then return end
+
+            local seriesName, volumeStr = book.Name:match("^(.-)_(.+)$")
+            local volumeNum = tonumber(volumeStr)
+
+            if seriesName and volumeNum then
+                local genreName, bookInfo = BooksData.GetCategory(seriesName)
+                if genreName and bookInfo then
+                    
+                    local shelfModel = findShelfForSeries(seriesName, genreName, bookInfo.VolumeCount)
+                    if shelfModel then
+                        local shelfData = LibraryReplica.Data.Shelves[shelfModel.Name]
+                        
+                        -- Kiểm tra xem kệ tại vị trí tập này đã có sách chưa
+                        if not (shelfData and shelfData.Books[tostring(volumeNum)]) then
+                            
+                            -- Hành động 1: Nhặt sách ẩn danh
+                            executeGhostAction(book, function()
+                                LibraryReplica:FireServer("Grab", book)
+                            end)
+
+                            -- Giãn cách siêu nhỏ (Bù delay nhận diện của Server)
+                            task.wait(0.04)
+
+                            -- Hành động 2: Đặt sách ẩn danh vào kệ
+                            if getgenv().Running and book.Parent == nil then -- Chỉ đặt khi Client đã Grab thành công
+                                executeGhostAction(shelfModel, function()
+                                    LibraryReplica:FireServer("Place", shelfModel, volumeNum - 1)
+                                end)
+                            end
+
+                        end
+                    end
+                end
+            end
+        end)
+        
+        -- Thêm một khoảng chờ siêu ngắn 0.01s giữa các Thread để tránh làm tụt FPS hoặc nghẽn băng thông Remote
+        task.wait(0.01) 
+    end
+
+    print("[🎯] Đã đưa toàn bộ sách vào hàng đợi thành công!")
+    getgenv().Running = false
+end)
